@@ -1,0 +1,293 @@
+diff --git a/Toobin.sv b/Toobin.sv
+index df2844b..9e927e5 100644
+--- a/Toobin.sv
++++ b/Toobin.sv
+@@ -42,8 +42,8 @@ assign USER_OUT = '1;
+ assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+ 
+-assign VGA_F1        = 0;
+ assign VGA_SCALER    = 0;
++// VGA_F1 carries the 480i field (VIDEO section)
+ assign VGA_DISABLE   = 0;
+ assign HDMI_FREEZE   = 0;
+ assign HDMI_BLACKOUT = 0;
+@@ -72,21 +72,20 @@ wire [11:0] ary = (!ar) ? (ar_rotated ? 12'd4 : 12'd3) : 12'd0;
+ 
+ `include "build_id.v"
+ localparam CONF_STR = {
+-	"Toobin;;",
++	"Toobin SD;;",             // SD build: VGA is 15 kHz 480i only; HDMI shows the normal picture
+ 	"-;",
+ 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+ 	"O[5:4],Orientation,Vert,No Rotate,No Rotate 180;",
+ 	"O[22:20],Scale,Normal,V-Integer,HV-Integer,Narrower HV-Integer;",
+ 	"-;",
+-	// Analog alignment.  Every field is plain two's complement, so the list is
+-	// 0,+1..+max then -min..-1 and the decode is a $signed() -- see
+-	// toobin_analog_adjust.sv.  None of these touch the core's timing.
+-	"P1,Analog alignment;",
++	// CRT 480i page (VGA / analog output). H/V-Position are two's complement: the list is
++	// 0,+1..+max then -min..-1 and the decode is a $signed().
++	"P1,CRT 480i;",
+ 	"P1-;",
+-	"P1O[27:23],CRT H-Size,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+-	"P1O[34:28],CRT H-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,+32,+33,+34,+35,+36,+37,+38,+39,+40,+41,+42,+43,+44,+45,+46,+47,+48,+49,+50,+51,+52,+53,+54,+55,+56,+57,+58,+59,+60,+61,+62,+63,-64,-63,-62,-61,-60,-59,-58,-57,-56,-55,-54,-53,-52,-51,-50,-49,-48,-47,-46,-45,-44,-43,-42,-41,-40,-39,-38,-37,-36,-35,-34,-33,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+-	"P1O[40:35],Analog VGA H-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+-	"P1O[46:41],Analog VGA V-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
++	"P1O[53:51],Deflicker,Off,Mild,Medium,Medium+,Full;",
++	"P1O[57:55],Height,1:1,200,208,216,224,232,240;",
++	"P1O[63:58],H-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
++	"P1O[68:64],V-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+ 	"-;",
+ 	// No DIP page: Toobin' has no dip switches.  MAME's INPUT_PORTS_START(toobin) has only
+ 	// the FF8800 controls and the FF9000 service/status word; every operator setting lives
+@@ -194,6 +193,8 @@ wire self_test = status[6];
+ 
+ wire        ce_pix;
+ wire  [7:0] core_r, core_g, core_b;
++wire  [9:0] core_pen, pal480_addr;     // CRT 480i: final pen out, colour lookup in
++wire [23:0] pal480_rgb;
+ wire        core_hs, core_vs, core_hb, core_vb;
+ wire signed [15:0] aud_l, aud_r;
+ 
+@@ -209,6 +210,7 @@ toobin_core #(.SDRAM_CLK_MHZ(64), .PIX_DIV(4), .CPU_DIV(8)) u_core
+ 	.sw_ff8800(sw_ff8800), .self_test(self_test), .coin1(coin1), .coin2(coin2),
+ 
+ 	.ce_pix(ce_pix), .vga_r(core_r), .vga_g(core_g), .vga_b(core_b),
++	.pen_o(core_pen), .pal480_addr(pal480_addr), .pal480_rgb(pal480_rgb),
+ 	.hsync(core_hs), .vsync(core_vs), .hblank(core_hb), .vblank(core_vb),
+ 
+ 	.aud_l(aud_l), .aud_r(aud_r),
+@@ -263,43 +265,76 @@ wire       video_rotated;
+ 
+ assign CLK_VIDEO = clk_sys;
+ 
+-// Analog alignment (CRT H-Size / H-Position, VGA H-Shift / V-Shift).  Placed
+-// ahead of arcade_video so the mixer, scandoubler and video_freak all see the
+-// adjusted raster; the core's own timing is untouched.  With H-Size active the
+-// pixel rate is no longer ce_pix, which is why arcade_video is clocked from
+-// adj_ce rather than ce_pix.
+-wire [7:0] adj_r, adj_g, adj_b;
+-wire       adj_hs, adj_vs, adj_hb, adj_vb, adj_ce;
+-
+-toobin_analog_adjust #(.H_TOTAL(640), .V_TOTAL(416), .CLK_PER_PIX(4)) u_analog_adjust
+-(
+-	.clk        (clk_sys),
+-	.ce_pix     (ce_pix),
+-	.osd_hsize  (status[27:23]),
+-	.osd_hpos   (status[34:28]),
+-	.osd_hshift (status[40:35]),
+-	.osd_vshift (status[46:41]),
+-	.r_in (R), .g_in (G), .b_in (B),
+-	.hs_in(HSync), .vs_in(VSync), .hb_in(HBlank), .vb_in(VBlank),
+-	.r_out(adj_r), .g_out(adj_g), .b_out(adj_b),
+-	.hs_out(adj_hs), .vs_out(adj_vs), .hb_out(adj_hb), .vb_out(adj_vb),
+-	.ce_out(adj_ce)
++// Video outputs, SD build. The native 512x384 / 25 kHz picture never reaches VGA.
++//   VGA_*    analog: crt_480i only, 15 kHz 480i (below). sys_top never puts the scaler on VGA
++//            in this build, and direct_video sends this same stream to HDMI.
++//   NATIVE_* the HDMI scaler: the native picture through arcade_video, with the usual Aspect
++//            ratio, Orientation, Scale and gamma.
++
++// ---- VGA: CRT 15kHz 480i (O[68:51]) ---------------------------------------------------------
++// Re-times the native raster into 525-line 480i for a low-res CRT (turned for this vertical
++// game): each field carries alternate source lines, one field per game frame. It stores the
++// 10-bit pen (exact colours, both parities in ~48 M10K) and looks colours up through a mirror of
++// the color RAM. It drives the VGA pins directly: arcade_video re-times VSync onto HSync, which
++// would remove field 1's half-line offset (no interlace).
++wire       ce480, i480_field;
++wire [7:0] i480_r, i480_g, i480_b;
++wire       i480_hs, i480_vs, i480_de;
++
++crt_480i #(.CLK_HZ(64_000_000), .CLK_DIV(6), .PW(10), .LUT_EXT(1), .LUT_LAT(2)) crt480i (   // 64 MHz / 6 = 10.67 MHz pixels
++	.clk      (clk_sys),
++	.ce_in    (ce_pix),
++	.pix_in   (core_pen),
++	.vs_in    (VSync), .de_in(~HBlank & ~VBlank),
++	.hoffset  ($signed({status[63], status[63:58]})),          // H-Position
++	.voffset  ($signed({{2{status[68]}}, status[68:64]})),    // V-Position
++	.deflicker(status[53:51]),
++	.vheight  (status[57:55]),
++	.lut_addr (pal480_addr),
++	.lut_rgb  (pal480_rgb),
++	.ce_out   (ce480),
++	.r_out    (i480_r), .g_out(i480_g), .b_out(i480_b),
++	.hs_out   (i480_hs), .vs_out(i480_vs), .de_out(i480_de),
++	.hb_out   (), .vb_out(),
++	.field    (i480_field),
++	.locked   ()
+ );
+ 
++assign CE_PIXEL = ce480;
++assign VGA_R    = i480_r;
++assign VGA_G    = i480_g;
++assign VGA_B    = i480_b;
++assign VGA_HS   = i480_hs;
++assign VGA_VS   = i480_vs;
++assign VGA_DE   = i480_de;
++assign VGA_F1   = i480_field;
++assign VGA_SL   = 2'd0;
++
++// ---- HDMI: the native picture ---------------------------------------------------------------
++// arcade_video's scandoubler is for 31 kHz VGA; here its output only feeds the HDMI scaler.
+ wire vga_de_raw;
+ 
+ arcade_video #(.WIDTH(512), .DW(24)) arcade_video
+ (
+-	.*,
+ 	.clk_video(clk_sys),
+-	.ce_pix(adj_ce),
+-	.RGB_in({adj_r, adj_g, adj_b}),
+-	.HBlank(adj_hb),
+-	.VBlank(adj_vb),
+-	.HSync(adj_hs),
+-	.VSync(adj_vs),
++	.ce_pix(ce_pix),
++	.RGB_in({R, G, B}),
++	.HBlank(HBlank),
++	.VBlank(VBlank),
++	.HSync(HSync),
++	.VSync(VSync),
++	.CLK_VIDEO(),
++	.CE_PIXEL(NATIVE_CE),
++	.VGA_R(NATIVE_R),
++	.VGA_G(NATIVE_G),
++	.VGA_B(NATIVE_B),
++	.VGA_HS(NATIVE_HS),
++	.VGA_VS(NATIVE_VS),
+ 	.VGA_DE(vga_de_raw),
+-	.fx(fx)
++	.VGA_SL(),
++	.fx(fx),
++	.forced_scandoubler(1'b0),
++	.gamma_bus(gamma_bus)
+ );
+ 
+ // Scale (status[22:20]) maps onto video_freak's SCALE encoding, which is
+@@ -315,11 +350,11 @@ wire [2:0] scale_sel = (status[22:20] == 3'd0) ? 3'd0 :   // Normal
+ video_freak video_freak
+ (
+ 	.CLK_VIDEO  (CLK_VIDEO),
+-	.CE_PIXEL   (CE_PIXEL),
+-	.VGA_VS     (VGA_VS),
++	.CE_PIXEL   (NATIVE_CE),
++	.VGA_VS     (NATIVE_VS),
+ 	.HDMI_WIDTH (HDMI_WIDTH),
+ 	.HDMI_HEIGHT(HDMI_HEIGHT),
+-	.VGA_DE     (VGA_DE),
++	.VGA_DE     (NATIVE_DE),
+ 	.VIDEO_ARX  (VIDEO_ARX),
+ 	.VIDEO_ARY  (VIDEO_ARY),
+ 	.VGA_DE_IN  (vga_de_raw),
+@@ -330,7 +365,19 @@ video_freak video_freak
+ 	.SCALE      (scale_sel)
+ );
+ 
+-screen_rotate screen_rotate (.*);
++// The rotated picture is HDMI's: screen_rotate takes the native stream.
++screen_rotate screen_rotate
++(
++	.CLK_VIDEO(CLK_VIDEO), .CE_PIXEL(NATIVE_CE),
++	.VGA_R(NATIVE_R), .VGA_G(NATIVE_G), .VGA_B(NATIVE_B),
++	.VGA_HS(NATIVE_HS), .VGA_VS(NATIVE_VS), .VGA_DE(NATIVE_DE),
++	.rotate_ccw(rotate_ccw), .no_rotate(no_rotate), .flip(flip), .video_rotated(video_rotated),
++	.FB_EN(FB_EN), .FB_FORMAT(FB_FORMAT), .FB_WIDTH(FB_WIDTH), .FB_HEIGHT(FB_HEIGHT),
++	.FB_BASE(FB_BASE), .FB_STRIDE(FB_STRIDE), .FB_VBL(FB_VBL), .FB_LL(FB_LL),
++	.DDRAM_CLK(DDRAM_CLK), .DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT),
++	.DDRAM_ADDR(DDRAM_ADDR), .DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE),
++	.DDRAM_WE(DDRAM_WE), .DDRAM_RD(DDRAM_RD)
++);
+ 
+ ///////////////////////   STATUS LED   ///////////////////////////
+ 
+diff --git a/files.qip b/files.qip
+index a6a1cfa..3773850 100644
+--- a/files.qip
++++ b/files.qip
+@@ -52,8 +52,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/toobin_mo_render.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/toobin_priority.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/toobin_palette.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/toobin_video.sv
+-set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/analog_hsize.sv
+-set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/toobin_analog_adjust.sv
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/crt_480i.sv
+ 
+ # JSA board
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/toobin_jsa_cen.sv
+diff --git a/rtl/toobin_core.sv b/rtl/toobin_core.sv
+index 5c81a41..d4e61d9 100644
+--- a/rtl/toobin_core.sv
++++ b/rtl/toobin_core.sv
+@@ -56,6 +56,9 @@ module toobin_core #(
+ 	// ---- video out (single clk_sys, qualified by ce_pix) ----
+ 	output logic        ce_pix,
+ 	output logic  [7:0] vga_r, vga_g, vga_b,
++	output logic  [9:0] pen_o,          // CRT 480i: final pen, aligned with vga_r/g/b
++	input  logic  [9:0] pal480_addr,    // CRT 480i: colour lookup (mirror palette)
++	output logic [23:0] pal480_rgb,
+ 	output logic        hsync, vsync, hblank, vblank,
+ 
+ 	// ---- audio ----
+@@ -307,6 +310,7 @@ module toobin_core #(
+ 		.intensity(intensity), .start_link(slip0[7:0]),
+ 		.sprb_addr(sprb_addr), .sprb_req(sprb_req), .sprb_valid(sprb_valid), .sprb_word(sprb_word),
+ 		.vga_r(vga_r), .vga_g(vga_g), .vga_b(vga_b),
++		.pen_o(pen_o), .pal480_addr(pal480_addr), .pal480_rgb(pal480_rgb),
+ 		.hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank), .ce_pix(),
+ 		.pf_rdata(pf_rdata32), .a_rdata(a_rdata16), .mo_rdata(mo_rdata16), .pal_rdata(pal_rdata16),
+ 		.irq_scanline(irq_scanline), .scanline_match(scanline_match),
+diff --git a/rtl/video/toobin_video.sv b/rtl/video/toobin_video.sv
+index e875209..2cc90df 100644
+--- a/rtl/video/toobin_video.sv
++++ b/rtl/video/toobin_video.sv
+@@ -51,6 +51,9 @@ module toobin_video
+ 
+ 	// ---- video out ----
+ 	output logic  [7:0] vga_r, vga_g, vga_b,
++	output logic  [9:0] pen_o,          // final pen, aligned with vga_r/g/b (CRT 480i)
++	input  logic  [9:0] pal480_addr,    // CRT 480i colour lookup: mirror palette, 1-clk read
++	output logic [23:0] pal480_rgb,
+ 	output logic        hsync, vsync, hblank, vblank,
+ 	output logic        ce_pix,
+ 
+@@ -180,15 +183,30 @@ module toobin_video
+ 		.clk(clk),
+ 		.a_addr(pal_wr_addr), .a_din(pal_wr_data), .a_we(pal_wr ? pal_wr_be : 2'b00), .a_dout(pal_rdata),
+ 		.b_addr(pen_s4),      .b_din(16'b0),       .b_we(2'b00), .b_re(ce),          .b_dout(color_s5) );
++	logic  [9:0] pen_s5;
+ 	always_ff @(posedge clk) begin
+ 		if (ce) begin
+ 			// stage 3 -> 4: latch merged pen + coordinate
+ 			pen_s4 <= pen_s3; ho_s4 <= pf_ho; vo_s4 <= pf_vo[8:0];
+ 			// stage 4 -> 5: color RAM read + coordinate  (port B)
+-			ho_s5 <= ho_s4; vo_s5 <= vo_s4;
++			ho_s5 <= ho_s4; vo_s5 <= vo_s4; pen_s5 <= pen_s4;
+ 		end
+ 	end
+ 
++	// CRT 480i: a mirror of the color RAM (same CPU writes) with its own read port, so the
++	// 480i stage can look colours up at its own time. Read every clock: 1-clk latency.
++	logic [15:0] color_480;
++	toobin_dpram #(.DW(16), .AW(10)) u_palram_480i (
++		.clk(clk),
++		.a_addr(pal_wr_addr), .a_din(pal_wr_data), .a_we(pal_wr ? pal_wr_be : 2'b00), .a_dout(),
++		.b_addr(pal480_addr), .b_din(16'b0),       .b_we(2'b00), .b_re(1'b1),        .b_dout(color_480) );
++	wire [7:0] r480, g480, b480;
++	toobin_palette u_pal_480i (.color(color_480), .intensity(intensity), .r(r480), .g(g480), .b(b480));
++	// Registered: the palette maths (brightness multiply + /31) gets a clock of its own, and the
++	// 480i stage is told the lookup takes 2 clocks (crt_480i LUT_LAT=2). As one clock into the
++	// 480i capture it failed timing (-0.37 ns at 64 MHz) or passed by a hair.
++	always_ff @(posedge clk) pal480_rgb <= { r480, g480, b480 };
++
+ 	wire [7:0] rr, gg, bb;
+ 	toobin_palette u_pal (.color(color_s5), .intensity(intensity), .r(rr), .g(gg), .b(bb));
+ 
+@@ -203,6 +221,7 @@ module toobin_video
+ 		vga_r  <= (out_hblank || out_vblank) ? 8'd0 : rr;
+ 		vga_g  <= (out_hblank || out_vblank) ? 8'd0 : gg;
+ 		vga_b  <= (out_hblank || out_vblank) ? 8'd0 : bb;
++		pen_o  <= (out_hblank || out_vblank) ? 10'd0 : pen_s5;
+ 	end
+ 
+ endmodule

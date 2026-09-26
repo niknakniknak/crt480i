@@ -1,0 +1,385 @@
+diff --git a/atarisys2.sv b/atarisys2.sv
+index 949b4e6..5b1427e 100644
+--- a/atarisys2.sv
++++ b/atarisys2.sv
+@@ -38,8 +38,8 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+ // "No Rotate" orientation.
+ 
+ assign VGA_SL          = 0;
+-assign VGA_F1          = 0;
+ assign VGA_SCALER      = 0;
++// VGA_F1 carries the 480i field (see the video output stage)
+ assign VGA_DISABLE     = 0;
+ assign HDMI_FREEZE     = 0;
+ assign HDMI_BLACKOUT   = 0;
+@@ -76,15 +76,10 @@ wire [11:0] ary = (ar == 2'd0) ? (ar_rotated ? 12'd4 : 12'd3) : 12'd0;
+ 
+ `include "build_id.v"
+ 
+-// CRT / analog-video fine-alignment page. Every field is 6-bit two's complement -- menu index 0..31 is
+-// 0..+31, index 32..63 is -32..-1 -- which is what the RTL below reads back with $signed().
+-// +-32 comes from the horizontal blanking budget rather than being an arbitrary cap: the line is
+-// 640 pixels with a 32-pixel front porch, a 64-pixel HSync and a 32-pixel back porch
+-// so both horizontal controls are usable across their whole range.
+-// Vertically the budget is asymmetric -- 8 blank lines before VSync and 16 after -- so the useful
+-// V-Shift range is about -8..+16; the field keeps the full +-32 to match the upstream core and to
+-// leave room for badly adjusted monitors, but past that VSync lands inside active video.
+-`define PB_ALIGN32 "0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1"
++// CRT 480i page. H-Position is 6-bit two's complement -- menu index 0..31 is 0..+31, index 32..63
++// is -32..-1 -- which is what the RTL below reads back with $signed(); V-Position is the same in
++// 5 bits (+-16).
++`define PB_POS32 "0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1"
+ 
+ // ---------------------------------------------------------------------------
+ // Physical DIP switches -- per-game.
+@@ -181,18 +176,18 @@ wire [11:0] ary = (ar == 2'd0) ? (ar_rotated ? 12'd4 : 12'd3) : 12'd0;
+ 	"H0O[99:98],Steering sensitivity,Normal,High,Low,Lowest;", \
+ 	"H0O[101:100],Steering deadzone,Normal,Small,Large,Largest;",
+ 
+-`define PB_CRT_ALIGN_MENU \
++`define PB_CRT480I_MENU \
+ 	"-;", \
+-	"P2,CRT Alignment;", \
+-	"P2-,Analog output only - HDMI uses Scale;", \
+-	"P2O[51:46],CRT H-Position,", `PB_ALIGN32, ";", \
+-	"P2O[57:52],Analog VGA H-Shift,", `PB_ALIGN32, ";", \
+-	"P2O[63:58],Analog VGA V-Shift,", `PB_ALIGN32, ";",
++	"P2,CRT 480i;", \
++	"P2O[125:123],Deflicker,Off,Mild,Medium,Medium+,Full;", \
++	"P2O[108:106],Height,1:1,200,208,216,224,232,240;", \
++	"P2O[114:109],H-Position,", `PB_POS32, ";", \
++	"P2O[119:115],V-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+ 
+ // The Service switch is an original operator control (TM-275 self-test / control
+ // calibration), not a debug aid, so it is a normal menu entry.
+ localparam CONF_STR = {
+-	"Atari System 2;;",
++	"AtariSys2 SD;;",         // SD build: VGA is 15 kHz 480i only; HDMI shows the normal picture
+ 	"-;",
+ 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+ 	"O[44:43],Scale,Normal,V-Integer,HV-Integer,Narrower HV-Integer;",
+@@ -205,7 +200,7 @@ localparam CONF_STR = {
+ 	`PB_STEER_MENU
+ 	"-;",
+ 	`PB_DIP_MENU
+-	`PB_CRT_ALIGN_MENU
++	`PB_CRT480I_MENU
+ 	"-;",
+ 	"O[4],Service switch,Off,On;",
+ 	"-;",
+@@ -371,93 +366,67 @@ sys2_video_timing video_timing
+ );
+ 
+ assign CLK_VIDEO = clk_sys;
+-assign CE_PIXEL  = ce_pix;
+-// VGA_DE / VGA_HS / VGA_VS / VGA_R / VGA_G / VGA_B are driven by the video output stage further
+-// down (search "Video output stage").
++assign CE_PIXEL  = ce_vid;           // VGA: the 480i pixel enable (the scaler has NATIVE_CE)
+ 
+ 
+ //============================================================================
+-// Video output stage: OSD scaling + analog CRT fine alignment.
+-//   O[44:43] Scale               -- HDMI/scaler integer modes (sys/video_freak.sv)  (O[45] spare)
+-//   O[51:46] CRT H-Position      -- moves the picture inside an untouched HSync
+-//   O[57:52] Analog VGA H-Shift  -- moves HSync itself, +-32 pixels
+-//   O[63:58] Analog VGA V-Shift  -- moves VSync itself, +-32 lines
+-//   (Everything from 46 to 94 is spoken for: 46-63 here, 64-92 the per-game DIP groups, and
+-//    O[94:93] APB's Orientation. O[95] is now SPARE -- it was the old 1-bit Rotation option,
+-//    replaced by the 2-bit field below it. O[97:96] is Paperboy's Coins/Credit, and
+-//    O[99:98] + O[101:100] are the two steering-feel fields (PB_STEER_MENU);
+-//    O[102] and up are free. Note O[51:46] is CRT H-Position -- a debug control was briefly
+-//    mis-assigned to O[47:46] and collided with it.)
+-// Ported from Arcade-Raiden_MiSTer by rmonic79 (GPL-3.0). Raiden's companion CRT H-Size control
+-// is deliberately NOT here: it stretches pixels in whole CLK_VIDEO periods, and Paperboy runs a
+-// 16 MHz pixel clock on a 32 MHz CLK_VIDEO, so its smallest step would be half a pixel (Raiden
+-// has 16 clocks per pixel, where the same step is invisible). See sys2_analog_hpos.sv.
+-//
+-// Every field defaults to 0, and at 0 this whole stage is a wire: each shift generator muxes back
+-// to the renderer's own sync output and the H-Position line buffer is bypassed, so a default build
+-// is bit-identical at VGA_* to having none of this.
++// Video outputs, SD build. The native 512x384 / 25 kHz picture never reaches VGA.
++//   VGA_*    analog / JAMMA: crt_480i only, 15 kHz 480i. It has no path for the native picture:
++//            until it has locked, black with both syncs idle. sys_top never puts the scaler on
++//            VGA in this build, and direct_video sends this same stream to HDMI.
++//   NATIVE_* the HDMI scaler: the native progressive picture, with the usual Aspect ratio,
++//            Scale and (APB) Orientation.
++//   O[125:123] Deflicker, O[108:106] Height, O[114:109] H-Position, O[119:115] V-Position
++//   (the CRT 480i page). O[63:46], the upstream analog alignment controls, are unused.
+ //============================================================================
+ 
+-// ---- Analog VGA H-Shift / V-Shift -----------------------------------------------------------
+-// Raster geometry and the renderer's sync pipeline depth, from sys2_video_timing and
+-// sys2_video_timing.sv. sys2_analog_sync_shift regenerates sync from the counters at these
+-// numbers, so they have to agree with the timing module -- simulation checks that
+-// by comparing against the real modules rather than against a copy of the constants.
+-wire hs_shifted, vs_shifted;
+-
+-sys2_analog_sync_shift #(
+-	.H_TOTAL(640), .H_SYNC_BEG(544), .H_SYNC_END(608),
+-	.V_TOTAL(416), .V_SYNC_BEG(392), .V_SYNC_END(400),
+-	.PIPE(4)
+-) analog_sync_shift (
+-	.clk    (clk_sys),
+-	.reset  (reset),
+-	.ce_pix (ce_pix),
+-	.h_count(h_count),
+-	.v_count(v_count),
+-	.hshift ($signed({status[57], status[57:52]})),
+-	.vshift ($signed({status[63], status[63:58]})),
+-	.hs_out (hs_shifted),
+-	.vs_out (vs_shifted)
+-);
+-
+-// At shift 0 the generator already reproduces the renderer's own sync exactly; muxing back to it
+-// anyway keeps a default build provably untouched even if the renderer's pipeline depth changes.
+-assign VGA_HS = (|status[57:52]) ? hs_shifted : video_hsync;
+-assign VGA_VS = (|status[63:58]) ? vs_shifted : video_vsync;
++// ---- VGA: CRT 480i ------------------------------------------------------------------------
++// Re-times the native raster into 525-line 480i: each field carries alternate source lines,
++// locked one field per game frame (rtl/crt_480i.sv). It stores the 8-bit palette index (exact
++// colours; both field parities fit in 48 M10K, which the deflicker needs) and gets the colour
++// back through the colour RAM's port C.
++wire       ce_vid;
++wire [7:0] i480_r, i480_g, i480_b, i480_lr, i480_lg, i480_lb;
++wire       i480_hs, i480_vs, i480_de, i480_field;
+ 
+-// ---- CRT H-Position -------------------------------------------------------------------------
+-// video_de is the only raster input it needs: it derives its own vertical gate from whether a
+-// buffered line carried any active video (see the module header for why a vblank input would be
+-// misaligned by the back porch).
+-wire       hpos_active = |status[51:46];
+-wire [7:0] hpos_r, hpos_g, hpos_b;
+-wire       hpos_de;
++sys2_palette palette_480i (.color_word(palette_480i_data), .r(i480_lr), .g(i480_lg), .b(i480_lb));
+ 
+-sys2_analog_hpos #(.AW(10)) analog_hpos     // 1024 per bank >= the 640-pixel horizontal total
+-(
+-	.clk     (clk_sys),
+-	.reset   (reset),
+-	.ce_pix  (ce_pix),
+-	.hoffset ($signed({status[51], status[51:46]})),
+-	.r_in    (video_red),
+-	.g_in    (video_green),
+-	.b_in    (video_blue),
+-	.hs_in   (video_hsync),                     // native HSync, never the shifted one
+-	.de_in   (video_de),
+-	.r_out   (hpos_r),
+-	.g_out   (hpos_g),
+-	.b_out   (hpos_b),
+-	.de_out  (hpos_de)
++crt_480i #(.CLK_HZ(32_000_000), .CLK_DIV(3), .PW(8), .LUT_EXT(1)) crt480i (   // 32 MHz / 3 = 10.67 MHz pixels
++	.clk      (clk_sys),
++	.ce_in    (ce_pix),
++	.pix_in   (video_index),
++	.vs_in    (video_vsync),
++	.de_in    (video_de),
++	.hoffset  ($signed({status[114], status[114:109]})),       // H-Position
++	.voffset  ($signed({{2{status[119]}}, status[119:115]})),  // V-Position
++	.deflicker(status[125:123]),
++	.vheight  (status[108:106]),                               // Height: 1:1, or 200..240 lines
++	.lut_addr (palette_480i_addr),
++	.lut_rgb  ({i480_lr, i480_lg, i480_lb}),
++	.ce_out   (ce_vid),
++	.r_out    (i480_r), .g_out(i480_g), .b_out(i480_b),
++	.hs_out   (i480_hs), .vs_out(i480_vs), .de_out(i480_de),
++	.hb_out   (), .vb_out(),
++	.field    (i480_field),
++	.locked   ()
+ );
+ 
+-// sys_top gates the analog DAC with VGA_DE (it feeds the scanline/OSD chain 0 outside it), so the
+-// repositioned picture and its DE window have to travel together.
+-wire vga_de_in = hpos_active ? hpos_de : video_de;
+-
+-assign VGA_R = hpos_active ? hpos_r : video_red;
+-assign VGA_G = hpos_active ? hpos_g : video_green;
+-assign VGA_B = hpos_active ? hpos_b : video_blue;
++assign VGA_R  = i480_r;
++assign VGA_G  = i480_g;
++assign VGA_B  = i480_b;
++assign VGA_HS = i480_hs;
++assign VGA_VS = i480_vs;
++assign VGA_DE = i480_de;
++assign VGA_F1 = i480_field;
++
++// ---- HDMI: the native picture -------------------------------------------------------------
++assign NATIVE_CE = ce_pix;
++assign NATIVE_R  = video_red;
++assign NATIVE_G  = video_green;
++assign NATIVE_B  = video_blue;
++assign NATIVE_HS = video_hsync;
++assign NATIVE_VS = video_vsync;
++// NATIVE_DE comes from video_freak (below), which crops it for the integer Scale modes.
+ 
+ // ---- Scale ------------------------------------------------------------------------------------
+ // video_freak SCALE codes: 0 normal, 1 V-integer, 2 HV-integer narrower, 3 HV-integer wider,
+@@ -474,10 +443,10 @@ video_freak video_freak
+ 	.VGA_VS     (video_vsync),                  // native VSync: frame measurement, not presentation
+ 	.HDMI_WIDTH (HDMI_WIDTH),
+ 	.HDMI_HEIGHT(HDMI_HEIGHT),
+-	.VGA_DE     (VGA_DE),
++	.VGA_DE     (NATIVE_DE),
+ 	.VIDEO_ARX  (VIDEO_ARX),
+ 	.VIDEO_ARY  (VIDEO_ARY),
+-	.VGA_DE_IN  (vga_de_in),
++	.VGA_DE_IN  (video_de),
+ 	.ARX        (arx),
+ 	.ARY        (ary),
+ 	.CROP_SIZE  (12'd0),                        // vertical crop is not exposed
+@@ -534,13 +503,13 @@ wire ar_rotated    =  vertical_game & (o_orient == 2'd0) & ~direct_video;
+ screen_rotate screen_rotate
+ (
+ 	.CLK_VIDEO(CLK_VIDEO),
+-	.CE_PIXEL (CE_PIXEL),
+-	.VGA_R    (VGA_R),
+-	.VGA_G    (VGA_G),
+-	.VGA_B    (VGA_B),
+-	.VGA_HS   (VGA_HS),
+-	.VGA_VS   (VGA_VS),
+-	.VGA_DE   (VGA_DE),
++	.CE_PIXEL (NATIVE_CE),                  // the rotated picture is HDMI's: the native stream
++	.VGA_R    (NATIVE_R),
++	.VGA_G    (NATIVE_G),
++	.VGA_B    (NATIVE_B),
++	.VGA_HS   (NATIVE_HS),
++	.VGA_VS   (NATIVE_VS),
++	.VGA_DE   (NATIVE_DE),
+ 	// CCW, measured against MAME rather than guessed (see above).
+ 	.rotate_ccw(1'b1),
+ 	.no_rotate (fb_no_rotate),
+@@ -1137,6 +1106,9 @@ wire [11:0] alpha_video_addr;
+ wire [15:0] alpha_video_data;
+ wire  [7:0] alpha_palette_addr;
+ wire  [7:0] palette_video_addr;
++wire  [7:0] palette_480i_addr;   // CRT 480i: its own palette read (colour RAM port C)
++wire [15:0] palette_480i_data;
++wire  [7:0] video_index;         // final palette index from the renderer
+ wire [15:0] palette_video_data;
+ wire [11:0] pf_top_render_addr, pf_bot_render_addr;
+ 
+@@ -2134,6 +2106,8 @@ sys2_main_bus main_bus
+ 	.playfield_bottom_pf_data    (pf_bot_pf_data),
+ 	.palette_video_addr (palette_video_addr),
+ 	.palette_video_data (palette_video_data),
++	.palette_480i_addr  (palette_480i_addr),
++	.palette_480i_data  (palette_480i_data),
+ 	.rom_bank0          (rom_bank0),
+ 	.rom_bank1          (rom_bank1),
+ 	.vmmu_bank          (vmmu_bank),
+@@ -2245,6 +2219,7 @@ sys2_video_render video_render
+ 	.pf_attr_en (1'b1),
+ 	.pal_addr   (alpha_palette_addr),
+ 	.pal_data   (palette_video_data),
++	.index_o    (video_index),
+ 	// Motion-object line buffer, driven by sys2_mob_engine (above): the renderer
+ 	// issues the per-pixel read-and-clear column and consumes the composited entry.
+ 	.mob_lb_col   (mob_lb_col),
+diff --git a/files.qip b/files.qip
+index 75aaec8..3e3632f 100644
+--- a/files.qip
++++ b/files.qip
+@@ -50,6 +50,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/rom/sys2_sprite_rom_arb.sv
+ 
+ # ---- video -------------------------------------------------------------------
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys2_video_timing.sv
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/crt_480i.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_palette.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_priority.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_pen4.sv
+@@ -61,8 +62,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_mob_linebuf.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_mob_walker.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_mob_engine.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_video_render.sv
+-set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_analog_hpos.sv
+-set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/sys2_analog_sync_shift.sv
+ 
+ # ---- sound -------------------------------------------------------------------
+ # YM2151 (jotego jt51, Verilog -- its own qip lists the synthesizable files),
+diff --git a/rtl/main/sys2_main_bus.sv b/rtl/main/sys2_main_bus.sv
+index 31e39d4..56081c4 100644
+--- a/rtl/main/sys2_main_bus.sv
++++ b/rtl/main/sys2_main_bus.sv
+@@ -72,6 +72,8 @@ module sys2_main_bus #(
+ 	output logic [15:0] playfield_bottom_pf_data,
+ 	input  logic [7:0]  palette_video_addr,
+ 	output logic [15:0] palette_video_data,
++	input  logic [7:0]  palette_480i_addr,   // third read port: the CRT 480i colour lookup
++	output logic [15:0] palette_480i_data,
+ 
+ 	output logic [5:0]  rom_bank0,
+ 	output logic [5:0]  rom_bank1,
+@@ -259,7 +261,7 @@ sys2_dpram #(.AW(11)) u_program_ram (
+ 	.c_rdata ()          // PORT_C off: no third copy is inferred
+ );
+ 
+-sys2_dpram #(.AW(8)) u_color_ram (
++sys2_dpram #(.AW(8), .PORT_C(1'b1)) u_color_ram (   // PORT_C: the 480i stage's own palette read
+ 	.clk,
+ 	.video_clk,
+ 	.a_addr  (bus_addr[8:1]),
+@@ -268,8 +270,8 @@ sys2_dpram #(.AW(8)) u_color_ram (
+ 	.a_rdata (color_cpu_q),
+ 	.b_addr  (palette_video_addr),
+ 	.b_rdata (palette_video_data),
+-	.c_addr  (8'd0),
+-	.c_rdata ()          // PORT_C off: no third copy is inferred
++	.c_addr  (palette_480i_addr),
++	.c_rdata (palette_480i_data)
+ );
+ 
+ sys2_dpram #(.AW(12)) u_alpha_ram (
+diff --git a/rtl/mem/sys2_dpram.sv b/rtl/mem/sys2_dpram.sv
+index cc66571..37a0b2a 100644
+--- a/rtl/mem/sys2_dpram.sv
++++ b/rtl/mem/sys2_dpram.sv
+@@ -20,7 +20,8 @@
+ module sys2_dpram #(
+ 	parameter int AW = 11,          // address width; depth = 2**AW
+ 	// Port C: a THIRD independent read-only copy. Off by default -- only the two playfield
+-	// map RAMs need it, and each enabled instance costs another 2 lanes of M10K.
++	// map RAMs and (in the CRT 480i builds) the colour RAM need it, and each enabled instance
++	// costs another 2 lanes of M10K.
+ 	//
+ 	// It exists because the playfield tile PREFETCHER needs the map at the same time the
+ 	// RENDERER does, and the two read different rows (the prefetcher runs two lines ahead).
+@@ -46,7 +47,7 @@ module sys2_dpram #(
+ 	input  logic [AW-1:0]  b_addr,
+ 	output logic [15:0]    b_rdata,
+ 
+-	// Port C: read only, independent address (playfield tile prefetch). Reads 0 when
++	// Port C: read only, independent address (playfield tile prefetch; 480i palette). Reads 0 when
+ 	// PORT_C is 0 and costs nothing -- the copy is not instantiated.
+ 	input  logic [AW-1:0]  c_addr,
+ 	output logic [15:0]    c_rdata
+diff --git a/rtl/video/sys2_video_render.sv b/rtl/video/sys2_video_render.sv
+index 8e01e8c..bc3a9a2 100644
+--- a/rtl/video/sys2_video_render.sv
++++ b/rtl/video/sys2_video_render.sv
+@@ -114,6 +114,7 @@ module sys2_video_render
+ 
+ 	// Colour RAM / palette (main-bus palette video port; one-cycle latency).
+ 	output logic [7:0]  pal_addr,
++	output logic [7:0]  index_o,      // final palette index, aligned with red/green/blue (480i)
+ 	input  logic [15:0] pal_data,
+ 
+ 	// Motion-object line-buffer read port (sys2_mob_engine). Read-and-clear,
+@@ -379,7 +380,7 @@ always_ff @(posedge clk) begin
+ 		pf_category2 <= '0;
+ 		hs2 <= 1'b0; vs2 <= 1'b0; hb2 <= 1'b1; vb2 <= 1'b1;
+ 		hs3 <= 1'b0; vs3 <= 1'b0; hb3 <= 1'b1; vb3 <= 1'b1;
+-		red <= '0; green <= '0; blue <= '0;
++		red <= '0; green <= '0; blue <= '0; index_o <= '0;
+ 		hsync_o <= 1'b0; vsync_o <= 1'b0; de_o <= 1'b0;
+ 	end else if (ce_pix) begin
+ 		// Stage 1: tile-map addresses.
+@@ -426,8 +427,10 @@ always_ff @(posedge clk) begin
+ 		// Stage 4: palette word -> RGB (blanked region black).
+ 		if (hb3 || vb3) begin
+ 			red <= '0; green <= '0; blue <= '0;
++			index_o <= '0;
+ 		end else begin
+ 			red <= pr; green <= pg; blue <= pb;
++			index_o <= pal_addr;
+ 		end
+ 		hsync_o <= hs3; vsync_o <= vs3; de_o <= ~(hb3 | vb3);
+ 	end
