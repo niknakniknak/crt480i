@@ -5,6 +5,9 @@
 //   clock    CLK64 (CLK_DIV 6) | CLK48 (CLK_DIV 4) [+ CDIV5 | FRAC] | default 32 MHz (CLK_DIV 3)
 //   source   NARROW (448 wide) | WIDE (544, past W_MAX) | TALL (448 lines) | FAST (70 Hz: must
 //            never lock) | SKEW (changes off the pixel enable)
+//   rate     VTOTAL=n, HTOTAL=n (frame rate: VTOTAL=500 is 50 Hz, 456 54.8, 435 57.5, 417 59.95;
+//            HTOTAL=610 VTOTAL=418 62.75) | NOLOCK (that rate is outside the window: must never lock)
+//            | RATECHG (VTOTAL changes to 500, 50 Hz, mid-run: it must unlock and relock at 625)
 //   module   DEFL=0..4, VHEIGHT=0..6, HOFF=n, VOFF=n, LUT2, PACKED (LUT_EXT=0)
 //   events   MIDRESET (source reset mid-line) | VSLOSS (the source VSync stops, then returns) |
 //            MENUCHG (Height and V-Position change mid-run, then change back)
@@ -55,18 +58,47 @@ localparam integer HACT = 544;
 localparam integer HACT = 512;
 `endif
 `ifdef TALL
-localparam integer VACT = 448, VTOT = 480;          // 52 Hz; Height 200 then shrinks (step > 1)
+// 52 Hz; Height 200 then shrinks (step > 1). The ring holds the backlog at the first active line:
+// active lines - output lines x (source line rate / output line rate) + 3 = 448 - 200 x 1.6 + 3,
+// about 131 lines, so this source needs a bigger RING than the default 96.
+localparam integer VACT = 448, VTOT0 = 480, RINGN = 160;
 `elsif FAST
-localparam integer VACT = 320, VTOT = 356;          // 70 Hz: out of the lock window
+localparam integer VACT = 320, VTOT0 = 356, RINGN = 96;   // 70 Hz: out of the lock window
+`define NOLOCK
 `else
-localparam integer VACT = 384, VTOT = 416;
+localparam integer VACT = 384, VTOT0 = 416, RINGN = 96;   // 60.1 Hz
 `endif
-localparam integer HTOT = 640, HS0 = HACT + 32, VS0 = VACT + 8;
+`ifdef VTOTAL
+localparam integer VTOT = `VTOTAL;
+`else
+localparam integer VTOT = VTOT0;
+`endif
+`ifdef HTOTAL
+localparam integer HTOT = `HTOTAL;
+`else
+localparam integer HTOT = 640;
+`endif
+localparam integer HS0 = HACT + 32, VS0 = VACT + 8;
+integer vtot = VTOT;                                // RATECHG changes it
 localparam integer WOUT = HACT > 512 ? 512 : HACT;  // pixels per output line
 // active lines per field, and the first active line (centred, offset, then clamped)
 localparam integer NOUT = `VHEIGHT ? 192 + 8*`VHEIGHT : (VACT/2 > 240 ? 240 : VACT/2);
-localparam integer VRAW = 21 + (240 - NOUT)/2 + `VOFF;
-localparam integer VEXP = VRAW < 6 ? 6 : VRAW > 262 - NOUT ? 262 - NOUT : VRAW;
+// Half-lines a frame expected (the rule in the module header, worked here in real numbers): lines a
+// field L = floor(15075 / fps + 11), HL = 2L + 1, at least 525. The extra lines of a slower frame
+// go half above the visible window: it starts (HL - 525) / 4 lines lower.
+integer TFS, HLX, VRAW, VEXP;                                   // source frame (clk), expected
+real    fps_s, lx;
+task expect_rate; begin
+    TFS   = HTOT * vtot * (PIXDIV + 1);
+    fps_s = 1.0 * CLKHZ / TFS;
+    lx    = 15075.0 / fps_s + 11.0;
+    HLX   = 2 * $rtoi(lx) + 1;
+    if( HLX < 525 ) HLX = 525;
+    VRAW  = 21 + (HLX - 525)/4 + (240 - NOUT)/2 + `VOFF;
+    VEXP  = VRAW < 6 ? 6 : VRAW > (HLX-1)/2 - NOUT ? (HLX-1)/2 - NOUT : VRAW;
+    $display("source %.3f Hz (%0d clk), 15075/fps+11 = %.3f: %0d half-lines, first active line %0d", fps_s, TFS, lx, HLX, VEXP);
+end endtask
+initial expect_rate;
 
 reg reset = 1, vs_kill = 0;
 reg [1:0] cediv = 0;
@@ -76,9 +108,9 @@ reg  [9:0] v_count = VTOT-1;
 always @(posedge clk) begin
     cediv  <= reset || cediv == PIXDIV ? 2'd0 : cediv + 1'd1;
     ce_pix <= !reset && cediv == PIXDIV;
-    if( reset ) begin h_count <= HTOT-1; v_count <= VTOT-1; end
+    if( reset ) begin h_count <= HTOT-1; v_count <= vtot-1; end
     else if( cediv == PIXDIV ) begin
-        if( h_count == HTOT-1 ) begin h_count <= 0; v_count <= v_count == VTOT-1 ? 10'd0 : v_count + 1'd1; end
+        if( h_count == HTOT-1 ) begin h_count <= 0; v_count <= v_count >= vtot-1 ? 10'd0 : v_count + 1'd1; end
         else h_count <= h_count + 1'd1;
     end
 end
@@ -137,7 +169,7 @@ localparam integer LUTE = 0;
 localparam integer LUTE = 1;
 `endif
 
-crt_480i #(.CLK_HZ(CLKHZ), .CLK_DIV(CDIV), .CLK_FRAC(FRAC), .H_START(HST), .HS_PIX(HSP),
+crt_480i #(.CLK_HZ(CLKHZ), .CLK_DIV(CDIV), .RING(RINGN), .CLK_FRAC(FRAC), .H_START(HST), .HS_PIX(HSP),
            .PW(24), .LUT_EXT(LUTE), .LUT_LAT(LUTL)) u_dut (
     .clk(clk), .ce_in(ce_pix), .pix_in({r, g, b}), .vs_in(vs), .de_in(de),
     .hoffset(7'(`HOFF)), .voffset(voffset), .deflicker(3'(`DEFL)), .vheight(vheight),
@@ -206,7 +238,7 @@ always @(posedge clk) if( active && ce_o ) begin
         if( fields > 1 ) begin
             if( act_lines != NOUT ) fail("active lines per field wrong");
             if( prev_frame >= 0 && fld_frame != ((prev_frame + 1) & 3) ) fail("field skipped or repeated a source frame");
-            if( lines_in_field != 262 && lines_in_field != 263 ) fail("lines per field not 262/263");
+            if( lines_in_field != (HLX-1)/2 && lines_in_field != (HLX+1)/2 ) fail("lines per field not (HL-1)/2 or (HL+1)/2");
         end
         if( fields > stat_from ) begin
             if( vs_period < min_vp ) min_vp = vs_period;
@@ -318,10 +350,10 @@ localparam integer TF_MAX = CLKHZ / 49;
 integer t0;
 initial begin
     #1000 reset = 0;
-`ifdef FAST
+`ifdef NOLOCK
     repeat( 3_000_000 ) @(posedge clk);
     $display("quiet (unlocked, no sync) clocks: %0d", quiet_clks);
-    if( ever_run ) tfail("locked onto a 70 Hz source");
+    if( ever_run ) tfail("locked onto a source outside the frame-rate window");
     if( errors + terrors ) $display("RESULT: FAIL (%0d errors)", errors + terrors); else $display("RESULT: PASS");
     $finish;
 `endif
@@ -342,6 +374,15 @@ initial begin
     wait( u_dut.run );
     dist_field = fields; stat_from = fields + 2;
 `endif
+`ifdef RATECHG
+    wait( fields == 6 );
+    @(posedge clk) wait( v_count == VACT + 2 );   // in vertical blank, before VSync
+    vtot = 500; expect_rate;
+    wait( !locked );
+    wait( locked );
+    dist_field = fields; stat_from = fields + 2;
+    min_hp = 1<<30; max_hp = 0; min_vp = 1<<30; max_vp = 0; ph0 = 0; ph1 = 0;
+`endif
 `ifdef MENUCHG
     wait( fields == 6 );
     repeat( 150_000 ) @(posedge clk);            // part-way through a field
@@ -358,9 +399,14 @@ initial begin
     $display("fields checked       : %0d", fields - 2);
     $display("last field with an error: %0d (of %0d)", last_err_field, fields);
     $display("HSync period (clk)   : %0d..%0d  (%.3f kHz)", min_hp, max_hp, CLKHZ / 1000.0 / ((min_hp + max_hp) / 2.0));
-    $display("VSync period (clk)   : %0d..%0d  (%.3f Hz, source %0d clk)", min_vp, max_vp, CLKHZ / ((min_vp + max_vp) / 2.0), VTOT*HTOT*(PIXDIV+1));
+    $display("VSync period (clk)   : %0d..%0d  (%.3f Hz, source %0d clk)", min_vp, max_vp, CLKHZ / ((min_vp + max_vp) / 2.0), TFS);
     $display("VSync line phase     : %0d fields at line start, %0d mid-line", ph0, ph1);
     if( max_hp - min_hp > 3 ) tfail("HSync jitter too large");
+    // the line rate a 15 kHz CRT holds, whatever the source frame rate
+    if( CLKHZ / ((min_hp + max_hp) / 2.0) < 15000.0 || CLKHZ / ((min_hp + max_hp) / 2.0) > 16500.0 )
+        tfail("line rate outside 15.0..16.5 kHz");
+    // one field per source frame: the field period is the source frame (within the start jitter)
+    if( min_vp < TFS - 2*CDIV_MAX || max_vp > TFS + 2*CDIV_MAX ) tfail("field period is not the source frame");
     // the field start lands on an output-pixel boundary: up to 2 output pixels of jitter, no drift
     if( max_vp - min_vp > 2*CDIV_MAX ) tfail("field period drifts");
     if( ph0 == 0 || ph1 == 0 || (ph0 - ph1 > 1) || (ph1 - ph0 > 1) ) tfail("VSync does not alternate line start / mid-line");

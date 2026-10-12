@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2026 Chris Watson. GPL v2 or later.
 //============================================================================
-//  crt_480i.sv  --  medium-res (25 kHz) source -> 15 kHz 480i for low-res CRTs
+//  crt_480i.sv  --  medium-res (25 kHz) source -> 15 kHz interlaced for low-res CRTs
 //  (15 kHz only: there is no native output path)
 //
 //  Sits between a core's native video and the MiSTer VGA (analog) output. It
 //  re-times a progressive source of up to W_MAX x 2*VIS_LINES (e.g. 512x384
-//  at about 25 kHz) into standard 525-line interlaced video. It has no path
-//  from its inputs to its outputs: the output is 480i, or black with both
+//  at about 25 kHz) into interlaced video at a 15 kHz line rate: 525 lines a
+//  frame (480i) for a 60 Hz source, 625 (576i) for 50 Hz, an odd count in
+//  between for anything else. It has no path
+//  from its inputs to its outputs: the output is interlaced, or black with both
 //  syncs idle until it has locked. The native picture can still go to HDMI,
 //  through the framework's scaler, beside it.
 //  Every field carries alternate source lines, so at Height 1:1 with
@@ -17,9 +19,16 @@
 //  - One output field per source frame. The field starts a measured delay
 //    after the source VSync, so the output is phase-locked to the source:
 //    no drift, no tearing, under one frame of latency.
-//  - Half-line cadence: 525 half-line ticks per source frame (Bresenham over
+//  - Half-line cadence: HL half-line ticks per source frame (Bresenham over
 //    the measured frame period, 1 clk jitter). Lines start on even ticks;
-//    field 1 starts on an odd tick, so its VSync lands mid-line: real 480i.
+//    HL is odd, so field 1 starts on an odd tick and its VSync lands mid-line.
+//  - HL comes from the measured frame period: the odd count nearest a line
+//    rate of 15075 + 11 x (frame rate) Hz, so 525 at 59.94 Hz (NTSC) and 625
+//    at 50 Hz (PAL); 571 for 54.82 Hz, 547 for 57.5 Hz (all about 15.65-15.76
+//    kHz). It is never below 525: from about 59.8 Hz up a field keeps 262.5 lines
+//    and the line rate rises with the frame rate, to 16.5 kHz at most. HL is
+//    held while locked. The lines a slower frame adds go half above, half
+//    below the visible window (VIS_FIRST moves down by (HL - 525) / 4).
 //  - Field 0 shows source lines 0,2,4..., field 1 lines 1,3,5..., from a
 //    RING-line buffer that holds every source line, both parities, because
 //    deflicker and stretch read the neighbouring lines too.
@@ -28,12 +37,17 @@
 //    field start is delayed so the last line read is still behind the source;
 //    that delay is computed per frame from what was measured. RING must exceed
 //    the backlog at the first active line: about 84 lines for 512x384 at 60 Hz.
+//    RING > hsrc + 4 - (out_lines - 1) x (output line / source line), with
+//    hsrc the active source lines, out_lines the output lines per field at
+//    the smallest Height used (hsrc/2 at 1:1, 240 at most) and an output line
+//    of 63.5 us (60.6 us at 16.5 kHz).
 //  - Pixels are replayed at clk/CLK_DIV (CLK_DIV+0.5 with CLK_FRAC): about
 //    10.67 MHz puts 512 pixels in 48 us of the 63.5 us line.
 //
 //  Self-measuring: frame period, line period, active width and height, and
 //  the VSync-to-first-active-line time. It locks after 3 stable frames, only
-//  at 49..63 Hz (the output line rate is 262.5 x the frame rate), and drops
+//  from 49 Hz up to the rate where 525 half-lines give a 16.5 kHz line
+//  (62.86 Hz), or lower if H_START + W_MAX would not fit that line, and drops
 //  the lock within a frame if the source VSync stops or its timing changes. A
 //  picture narrower than W_MAX or shorter than the field is centred; pixels
 //  past W_MAX are dropped. At 1:1 an odd last source line is not shown.
@@ -63,7 +77,7 @@
 //============================================================================
 
 module crt_480i #(
-    parameter CLK_HZ    = 0,     // clk frequency, Hz (required): only 49..63 Hz sources lock
+    parameter CLK_HZ    = 0,     // clk frequency, Hz (required): only 49..62.86 Hz sources lock
     parameter CLK_DIV   = 3,     // output pixel = clk / CLK_DIV; >= 3 for deflicker
     parameter CLK_FRAC  = 0,     // 1: pixels alternate CLK_DIV and CLK_DIV+1 clocks (e.g. 48 MHz / 4.5)
     parameter W_MAX     = 512,   // max active width stored per line (power of 2)
@@ -95,9 +109,9 @@ module crt_480i #(
     output            ce_out,
     output reg [7:0]  r_out, g_out, b_out,
     output reg        hs_out, vs_out, de_out,
-    output reg        hb_out, vb_out,   // de = ~hb & ~vb (do NOT feed 480i through arcade_video)
+    output reg        hb_out, vb_out,   // de = ~hb & ~vb (do NOT feed this through arcade_video)
     output reg        field,     // 1 while the lower field (odd source lines) is out
-    output            locked     // the source is measured and the 480i stream is out
+    output            locked     // the source is measured and the interlaced stream is out
 );
 
 localparam AW   = $clog2(W_MAX);
@@ -118,7 +132,13 @@ reg [AW:0] xw = 0, ws_run = 0, wsrc = 0;
 reg        seen_de = 0;
 reg [ 1:0] stable = 0;
 assign     locked = stable == 2'd3;
-localparam [21:0] TF_MIN = CLK_HZ / 63, TF_MAX = CLK_HZ / 49;   // 63..49 Hz: 16.5..12.9 kHz out
+// Frame-rate window. Slowest: 49 Hz (HL 637, 15.6 kHz). Fastest: HL is 525 from 59.94 Hz up, so
+// the output line is tf / 262.5; it must last at least a 16.5 kHz line and hold H_START + W_MAX.
+localparam integer OUT_X2 = 2 * CLK_DIV + CLK_FRAC;               // clocks per 2 output pixels
+localparam integer TL_HZ  = CLK_HZ / 16500 + 1;
+localparam integer TL_PX  = ((H_START + W_MAX) * OUT_X2 + 1) / 2;
+localparam integer TL_MIN = TL_HZ > TL_PX ? TL_HZ : TL_PX;      // shortest output line, clk
+localparam [21:0] TF_MIN = (TL_MIN * 525 + 1) / 2, TF_MAX = CLK_HZ / 49;
 
 always @(posedge clk) begin
     vs_l <= vs_in;
@@ -147,8 +167,7 @@ always @(posedge clk) begin
         hs_run  <= 0;
         ws_run  <= 0;
         seen_de <= 0;
-        // two consecutive frames within 4 clk, with a picture in them, at a frame rate that
-        // gives a 15 kHz line (the output line is the frame / 262.5)
+        // two consecutive frames within 4 clk, with a picture in them, inside the window
         if( hs_run != 0 && fcnt >= TF_MIN && fcnt <= TF_MAX &&
             ((fcnt > tf ? fcnt - tf : tf - fcnt) < 22'd4) )
             stable <= stable == 2'd3 ? 2'd3 : stable + 1'd1;
@@ -161,8 +180,40 @@ end
 // ---------------------------------------------------------------------------
 // Per-frame geometry: output line period, active window and field delay
 // ---------------------------------------------------------------------------
-// tlo = tf / 262.5 = tf * 63913 >> 24 (error < 1 clk)
+// Half-lines a frame: L = floor(15075 x tf / CLK_HZ + 11) lines a field, HL = 2L + 1, at least 525.
+// (Line rate (L + 0.5) x fps: 525 at 59.94 Hz, 625 at 50 Hz.) Followed while unlocked, held while
+// locked, so a frame period on a rounding boundary cannot switch it back and forth.
+localparam [47:0] HL_K = CLK_HZ == 0 ? 48'd0 : ((48'd15075 << 32) + CLK_HZ / 2) / CLK_HZ;
+reg [45:0] m_hl = 0;
+reg [13:0] hl_f = 0;               // lines a field, before the 525 floor
+reg [10:0] hl_n = 11'd525;         // half-lines a frame (odd)
+always @(posedge clk) begin
+    m_hl <= tf * HL_K[23:0];
+    hl_f <= m_hl[45:32] + 14'd11;
+    if( !locked ) hl_n <= hl_f < 14'd262 ? 11'd525 : hl_f > 14'd1023 ? 11'd2047 : { hl_f[9:0], 1'b1 };
+end
+
+// tlo = tf / (HL/2) = 2 tf / HL, output line period (floor, error < 1 clk): a shift-subtract
+// divider, 24 clocks a result, running all the time (tf and HL change at most once a frame)
 reg [21:0] tlo = 0;
+reg [ 4:0] dv_n = 0;
+reg [22:0] dv_q = 0;               // numerator in, quotient out
+reg [10:0] dv_r = 0, dv_d = 11'd525;
+wire [11:0] dv_t  = { dv_r, dv_q[22] };
+wire        dv_ge = dv_t >= { 1'b0, dv_d };
+always @(posedge clk) begin
+    if( dv_n == 0 ) begin
+        dv_q <= { tf, 1'b0 };
+        dv_r <= 0;
+        dv_d <= hl_n;
+        dv_n <= 5'd23;
+    end else begin
+        dv_r <= dv_ge ? dv_t[10:0] - dv_d : dv_t[10:0];
+        dv_q <= { dv_q[21:0], dv_ge };
+        dv_n <= dv_n - 1'd1;
+        if( dv_n == 1 ) tlo <= { dv_q[20:0], dv_ge };
+    end
+end
 reg [ 9:0] half_act = 0;           // source lines per field (1:1)
 reg [ 9:0] out_lines = 0;          // active output lines per field
 wire       vfull = vheight != 0;
@@ -184,10 +235,10 @@ reg [33:0] m_step;
 reg [ 9:0] vstart = 0;             // first active line of a field
 reg [ 9:0] v_cen = 0, v_hi = 0;
 reg signed [11:0] v_want = 0;
-// the active lines stay clear of VSync and inside the 262 whole lines of a field
+// the active lines stay clear of VSync and inside the (HL-1)/2 whole lines of a field
 localparam integer V_MIN = (VS_HL + VS_LEN + 1) / 2;
 reg [22:0] dly = 0;                // source VSync -> field start
-reg [37:0] m_tlo;
+reg [ 9:0] v_add = 0;              // lines a slower frame adds above the visible window
 // What a field displays: a snapshot, taken at its start, of the same geometry its start time was
 // computed from. A menu change (Height, V-Position) therefore applies whole, from a field start.
 reg        f_vfull = 0;
@@ -197,13 +248,12 @@ reg [21:0] m_src, m_out;
 
 always @(posedge clk) begin
     // pipelined over the frame; results are stable long before they are used
-    m_tlo    <= tf * 16'd63913;
-    tlo      <= m_tlo[37:24];
+    v_add    <= (hl_n - 11'd525) >> 2;
     half_act <= hsrc[9:1];
     out_lines<= vfull ? hsel : half_act > VIS_LINES ? VIS_LINES[9:0] : half_act;
     v_cen    <= (VIS_LINES[9:0] - out_lines) >> 1;       // centred in the visible lines
-    v_want   <= $signed({2'b00, VIS_FIRST[9:0] + v_cen}) + $signed({{5{voffset[6]}}, voffset});
-    v_hi     <= 10'd262 - out_lines;
+    v_want   <= $signed({2'b00, VIS_FIRST[9:0] + v_add + v_cen}) + $signed({{5{voffset[6]}}, voffset});
+    v_hi     <= hl_n[10:1] - out_lines;
     vstart   <= v_want < V_MIN ? V_MIN[9:0] : v_want > $signed({2'b00, v_hi}) ? v_hi : v_want[9:0];
     // step = hsrc / (2*lines) in 8.16: hsrc * floor(2^24/(2*lines)) >> 8
     m_step   <= hsrc * hk;
@@ -260,7 +310,7 @@ reg        ce_o = 0;
 wire       run = locked;
 
 wire       fstart = armed && dcnt >= dly;   // >=: a dly that moved earlier still starts
-wire       tick   = acc + 23'd525 >= {1'b0, tf};
+wire       tick   = acc + {12'd0, hl_n} >= {1'b0, tf};
 
 always @(posedge clk) begin
     dcnt <= vs_rise ? 23'd0 : dcnt + 1'd1;
@@ -290,10 +340,10 @@ always @(posedge clk) begin
         end
     end else begin
         if( tick ) begin
-            acc <= acc + 23'd525 - {1'b0, tf};
+            acc <= acc + {12'd0, hl_n} - {1'b0, tf};
             hl  <= hl + 1'd1;
         end else
-            acc <= acc + 23'd525;
+            acc <= acc + {12'd0, hl_n};
         // a line starts on every tick that lands on an even half-line of the frame
         if( tick && ((hl + 1'd1 + fpar) & 1) == 0 ) begin
             cdiv <= 0;
@@ -481,15 +531,17 @@ initial begin
         $fatal(1, "crt_480i: CLK_FRAC needs PM/CLK_DIV == PM/(CLK_DIV+1) (e.g. CLK_DIV 4)");
     if( W_MAX != 1 << AW )             $fatal(1, "crt_480i: W_MAX must be a power of 2");
     if( !LUT_EXT && PW < 6 )           $fatal(1, "crt_480i: packed colour needs PW >= 6");
-    if( VIS_FIRST + VIS_LINES > 262 )  $fatal(1, "crt_480i: VIS_FIRST + VIS_LINES exceed a field");
+    if( VIS_FIRST + VIS_LINES > 262 )  $fatal(1, "crt_480i: VIS_FIRST + VIS_LINES exceed a field");   // 525: the shortest
+    if( CLK_HZ != 0 && (HL_K >= (1 << 24) || HL_K < (1 << 17)) ) $fatal(1, "crt_480i: CLK_HZ out of range (4..200 MHz)");
     if( VIS_FIRST < V_MIN )            $fatal(1, "crt_480i: VIS_FIRST overlaps VSync");
 end
 // synthesis translate_on
 // The same rules as build errors (Quartus ignores the block above): each instantiates a module
 // that does not exist, named after the problem.
-localparam integer OUT_X2  = 2 * CLK_DIV + CLK_FRAC;                 // clocks per 2 output pixels
-localparam integer LINE_49 = CLK_HZ / OUT_X2 * 2 / 12862;             // output pixels a line, 49 Hz
-localparam integer LINE_60 = CLK_HZ / OUT_X2 * 2 / 15734;             // output pixels a line, 60 Hz
+// Output line rates: 15.58 kHz at the slowest (49 Hz); below 59.94 Hz never over 15.77 kHz (the
+// line rate is 15075 + 10.5..11.5 x fps), above it the window keeps the line long enough.
+localparam integer LINE_LO = CLK_HZ / OUT_X2 * 2 / 15580;             // output pixels, longest line
+localparam integer LINE_HI = CLK_HZ / OUT_X2 * 2 / 15770;             // output pixels, 59.94 Hz and below
 generate
     if( CLK_HZ == 0 ) begin : g_needs_clk_hz
         crt_480i_set_the_CLK_HZ_parameter u_err();
@@ -500,10 +552,14 @@ generate
     if( CLK_FRAC && PM / CLK_DIV != PM / (CLK_DIV+1) ) begin : g_clk_frac
         crt_480i_CLK_FRAC_needs_the_same_latency_for_both_pixel_lengths u_err();
     end
-    if( CLK_HZ != 0 && LINE_49 > 2047 ) begin : g_too_fast
+    if( CLK_HZ != 0 && LINE_LO > 2047 ) begin : g_too_fast
         crt_480i_output_pixel_clock_too_fast u_err();       // aim for about 10-11 MHz
     end
-    if( CLK_HZ != 0 && LINE_60 < H_START + W_MAX ) begin : g_too_slow
+    // also catches a tool that worked HL_K out in 32 bits (it would be 0: always 525, silently)
+    if( CLK_HZ != 0 && (HL_K >= (1 << 24) || HL_K < (1 << 17)) ) begin : g_clk_hz_range
+        crt_480i_CLK_HZ_out_of_range_4_to_200_MHz u_err();
+    end
+    if( CLK_HZ != 0 && LINE_HI < H_START + W_MAX ) begin : g_too_slow
         crt_480i_output_line_too_short_for_H_START_plus_W_MAX u_err();
     end
 endgenerate
@@ -558,7 +614,8 @@ always @(posedge clk) if( ce_o ) begin
 end
 
 // Until locked (core load, reset, or a change in the source timing) the output is black with
-// both syncs idle, so the monitor never sees anything but 480i. The pixel enable always runs.
+// both syncs idle, so the monitor never sees anything but the interlaced stream. The pixel enable
+// always runs.
 assign ce_out = ce_o;
 always @* begin
     r_out  = run ? r_o  : 8'd0;

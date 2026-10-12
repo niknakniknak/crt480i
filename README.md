@@ -1,7 +1,9 @@
 # crt_480i: medium-res MiSTer cores on a 15 kHz CRT
 
 A module for MiSTer cores. It turns a medium-res (about 25 kHz) progressive picture, such
-as 512x384 at 60 Hz, into standard 525-line **480i** on the analog (VGA) output. That lets
+as 512x384 at 60 Hz, into **interlaced 15 kHz** video on the analog (VGA) output: 525-line
+**480i** for a 60 Hz source, 625-line 576i for 50 Hz, and an odd line count in between for
+any other frame rate, so the line rate stays near 15.7 kHz. That lets
 a normal low-res CRT, PVM or 15 kHz arcade monitor show it with every source line intact,
 while HDMI shows the normal picture.
 
@@ -52,7 +54,7 @@ damage to your monitor or other equipment.
 
 ```
 rtl/crt_480i.sv      the module: one SystemVerilog file, Quartus 17 friendly
-sim/                 self-checking testbench, run.sh (one run), sweep.sh (38 runs)
+sim/                 self-checking testbench, run.sh (one run), sweep.sh (62 runs)
 examples/            sys.patch (the framework change) and three complete cores
 AGENTS.md            instructions for an AI coding agent doing the port
 skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-skill.sh)
@@ -63,14 +65,25 @@ skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-s
 - **One output field per source frame.** Field 0 carries source lines 0,2,4..., field 1
   lines 1,3,5... Every field comes from a new frame, so motion stays at the source's 60 Hz.
   Only the fine vertical detail is split across two fields.
-- **Real interlace.** 262.5 lines per field; field 1's VSync starts half a line late, so the
-  CRT draws its lines between field 0's. `field` drives `VGA_F1`.
+- **Real interlace.** An odd number of half-lines a frame (525 at 60 Hz: 262.5 lines per
+  field); field 1's VSync starts half a line late, so the CRT draws its lines between field
+  0's. `field` drives `VGA_F1`.
+- **Line count from the frame rate.** The output line rate is (half-lines / 2) x the source
+  frame rate, so a fixed 525 would give 14.4 kHz at 54.8 Hz and 13.1 kHz at 50 Hz, which a 15
+  kHz CRT cannot hold. The module measures the frame and picks the odd count nearest a line
+  rate of 15075 + 11 x frame rate (Hz): 525 at 59.94 Hz, 625 at 50 Hz, 571 at 54.8 Hz, 547 at
+  57.5 Hz, all 15.6-15.8 kHz. Never fewer than 525: from 59.94 Hz up a field keeps 262.5 lines
+  and the line rate rises with the frame rate (16.5 kHz at 62.86 Hz). The extra lines of a
+  slower frame are split above and below the picture, so it stays centred. The count is
+  held while locked.
 - **Phase-locked.** Each field starts a measured delay after the source VSync: no drift, no
   dropped or repeated frames. Latency is under one frame.
 - **Self-measuring.** Frame period, line period, active size and VSync-to-picture time are
   measured, not configured. It locks once 3 frames in a row have matched periods (within
-  4 clocks), about 5 frames after the core starts, and only at 49-63 Hz: the output line
-  rate is 262.5 x the source frame rate, so this window keeps it at 12.9-16.5 kHz. If the
+  4 clocks), about 5 frames after the core starts, and only from 49 Hz up to the rate where
+  525 half-lines give a 16.5 kHz line (62.86 Hz; lower if `H_START + W_MAX` pixels would not
+  fit that line, which the build's clock settles). So the output line is always 15.6-16.5
+  kHz. If the
   source VSync stops it drops the lock within a frame. A source whose frame period jitters
   by more than 4 clocks (for example regenerated through a clock crossing) never locks.
 - **Storage.** A ring of 96 source lines holds pixel values, ideally palette indexes looked
@@ -85,7 +98,7 @@ skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-s
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `CLK_HZ` | (required) | the module clock in Hz, accurately: it sets the 49-63 Hz lock window, so a wrong value can admit a faster source. |
+| `CLK_HZ` | (required) | the module clock in Hz, accurately: it sets the lock window (49 Hz to at most 62.86 Hz) and the line count, so a wrong value can admit a faster source or a wrong line rate. |
 | `CLK_DIV` | 3 | output pixel = `clk / CLK_DIV`. Aim for about 10-11 MHz (e.g. 32/3, 64/6). Minimum 3. See *Other video clocks*. |
 | `CLK_FRAC` | 0 | 1: pixels alternate `CLK_DIV` and `CLK_DIV+1` clocks, averaging `CLK_DIV+0.5` (48 MHz with `CLK_DIV(4)` gives exactly 10.67 MHz). Needs `(4+LUT_LAT)/CLK_DIV == (4+LUT_LAT)/(CLK_DIV+1)`, e.g. `CLK_DIV 4`. |
 | `PW` | 8 | bits stored per pixel (a palette index, or packed colour) |
@@ -97,7 +110,8 @@ skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-s
 The build stops with a named error (a missing module called, for example,
 `crt_480i_output_pixel_clock_too_fast`) if `CLK_HZ` is missing, `CLK_DIV` is below 3, the
 `CLK_FRAC` rule is broken, or the output pixel clock doesn't fit a line: too fast (over
-2047 pixels a line at 49 Hz) or too slow (fewer than `H_START + W_MAX` at 60 Hz). The
+2047 pixels in a 15.58 kHz line) or too slow (fewer than `H_START + W_MAX` in a 15.77 kHz
+line, the fastest below 59.94 Hz). The
 simulation checks a few more (`LUT_LAT`, `W_MAX`, `VIS_*`).
 
 Ports:
@@ -179,20 +193,30 @@ Drivin' example). Keep the active line at about 52-53 us or less.
 
 ### Limits
 
-- Source frame rate 49-63 Hz. Width up to `W_MAX`; height up to 2 x `VIS_LINES` (480).
-- The ring must hold the backlog at the first active line. At Height 1:1 that is about
-  `lines per field x (2 - source total lines / 262.5) + 3`: for 384 active lines, a vertical
-  total of at least about 400 lines with `RING=96` (the example cores have 416). With less
-  vertical blanking, raise `RING`.
+- Source frame rate 49 Hz up to 62.86 Hz (or the lower limit your clock sets, above). Width
+  up to `W_MAX`; height up to 2 x `VIS_LINES` (480).
+- The ring must hold the backlog at the first active line: about
+  `active source lines - output lines per field x (source line rate / output line rate) + 3`
+  lines, with the output line rate 15.7 kHz (up to 16.5 kHz above 59.94 Hz) and the output
+  lines per field the smallest Height offered (half the active lines at 1:1; 200 if the
+  Height menu can shrink a taller picture). At 60 Hz the ratio is source total lines / 262.5.
+  384 active lines at 25 kHz: about 84 at 1:1 and 66 at Height 200, inside `RING=96` (the
+  example cores). 448 lines at 25 kHz shrunk to 200: about 131, so `RING=160`. More active
+  lines or less vertical blanking need a bigger `RING`; too small a ring shows lines from the
+  wrong frame (the testbench catches it).
 - The field start is placed so that the last line of the picture is never read before it
   is written. The first lines are safe too while the output reads source lines faster than
-  they arrive: (source total lines / 262.5) < (source active lines / output lines). For a
+  they arrive: (source line rate / output line rate) < (source active lines / output lines). For a
   384-line picture at Height 240 that is a total of up to about 420 lines; the example
   cores are 416.
 - Height and V-Position take effect from the next field start, as a whole. A change can move
   the field start within the source frame, so the picture may jump once (one long or short
   field) as you change them.
 - Gamma (`arcade_video`) now applies to HDMI only; the 480i output uses the palette as is.
+- MiSTer's gamma (`sys/gamma_corr.sv`, inside `arcade_video`) needs at least 4 `CLK_VIDEO`
+  clocks per pixel. With fewer (48 MHz at 3 clocks a pixel, for example) HDMI comes out
+  pink/green whenever gamma is on. Either grey Gamma out of the menu (`hps_io`
+  `gamma_bus[21] = 0`) or give `arcade_video` at least 4 clocks per pixel.
 
 ## Testing
 
@@ -201,11 +225,14 @@ cd sim
 ./run.sh                                  # 32 MHz source clock, CLK_DIV 3
 ./run.sh -DDEFL=4 -DVHEIGHT=6             # Full deflicker, 240 lines per field
 ./run.sh -DCLK64 -DLUT2 -DMIDRESET        # 64 MHz, CLK_DIV 6, 2-clock palette, reset mid-line
-./sweep.sh                                # the whole matrix, 38 runs, several at a time
+./run.sh -DVTOTAL=500                     # a 50 Hz source: 625 half-lines, 15.625 kHz
+./sweep.sh                                # the whole matrix, 62 runs, several at a time
+./mutants.sh                              # 13 deliberately broken modules: every one must FAIL
 ```
 
 All defines are listed at the top of `tb_crt_480i.sv`: clocks (including the fractional
-divider), narrow, wide, tall and 70 Hz sources, offsets, a mid-line reset and a VSync loss,
+divider), narrow, wide, tall and 70 Hz sources, frame rates from 49 to 63 Hz (`VTOTAL`,
+`HTOTAL`, `NOLOCK` for a rate that must not lock), offsets, a mid-line reset and a VSync loss,
 and `DUMP` for bit-exact comparisons between two versions of the module. A pass ends with
 `RESULT: PASS`; after a disturbance, "picture errors only in the disturbed field ...
 recovered" is also a pass. The module checks its parameters when simulated.
@@ -217,10 +244,13 @@ palette mode. The presets are `-DCLK64`, `-DCLK48` (with `-DCDIV5` or `-DFRAC`) 
 32 MHz default.
 
 The bench drives a 640x416 raster (512x384 active) by default. It checks line routing and
-parity, pixel order, one source frame per field, 262/263 lines and the half-line VSync,
+parity, pixel order, one source frame per field, (HL-1)/2 or (HL+1)/2 lines a field for the
+expected half-line count HL, a line rate inside 15.0-16.5 kHz, a field period equal to the
+source frame, the half-line VSync,
 deflicker and stretch values against an independent model, the picture's position, that
 field 1 carries the odd lines, that the output is quiet until locked, that a VSync loss
-unlocks within a frame, and that a 70 Hz source never locks.
+unlocks within a frame, and that sources outside the window (48.7 Hz, 63.2 Hz, 70 Hz) never
+lock.
 
 ## Examples
 

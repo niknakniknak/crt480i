@@ -36,9 +36,13 @@ Write these down before editing anything:
 1. The video clock that the pixel enable runs on, and the pixel enable itself.
 2. H and V totals and the active area, from the counters (the module measures them at run
    time, but you need them to choose parameters and to check the limits in `README.md`).
-3. The frame rate (49-63 Hz, or the module never locks), the frame-period stability (must
-   match within 4 clocks frame to frame) and the vertical total: at Height 1:1 the 96-line
-   ring needs `lines per field x (2 - total / 262.5) + 3 < 96` (384 active: total >= ~400).
+3. The frame rate (49 Hz up to 62.86 Hz, or the module never locks; the module picks the
+   line count itself, e.g. 625 at 50 Hz, 571 at 54.8 Hz, 525 at 60 Hz), the frame-period
+   stability (must match within 4 clocks frame to frame) and the line rates: the ring needs
+   `active lines - output lines x (source line rate / 15.7 kHz) + 3 < RING` (16.5 kHz above
+   60 Hz), output lines = the smallest Height offered (active/2 at 1:1, 200 if Height can
+   shrink the picture). 384 active lines at 25 kHz: about 84, inside the default 96; 448
+   lines shrunk to 200: about 131, so `RING(160)`.
 4. Where the palette lookup happens, the pixel **index** width before it, and the lookup's
    latency. The index must be aligned with the RGB it produces (same pixel).
 5. Which status bits are free (for the menu), and anything between the core and `VGA_*`
@@ -88,16 +92,22 @@ Write these down before editing anything:
   flag bit and force black after the lookup.
 - **RBF naming.** MiSTer loads the alphabetically last `<rbf>_*.rbf` or `<rbf>.rbf`. Name the
   build so it can't be matched as `<stock-name>_...`, and check every MRA in the folder.
+- **HDMI pink/green with Gamma on.** MiSTer's gamma (`sys/gamma_corr.sv`, in `arcade_video`)
+  needs at least 4 `CLK_VIDEO` clocks per pixel; at 3 (e.g. 48 MHz, 16 MHz pixels) the colours
+  break. Either grey Gamma out (`hps_io` `gamma_bus[21] = 0`) or give `arcade_video` at least
+  4 clocks per pixel.
 - Quartus 17 on the core: Verilog-2001 in `.v` files. The module is `.sv` and is fine.
 
 ## Verify
 
 1. **Module unchanged?** Don't edit `rtl/crt_480i.sv`. If you must, run `sim/sweep.sh`
-   (every line must end `RESULT: PASS`) before building anything.
+   (every line must end `RESULT: PASS`) and `sim/mutants.sh` (every mutant must FAIL)
+   before building anything.
 2. **Your source timing:** edit the top of `sim/tb_crt_480i.sv`: the raster (`HACT`,
    `VACT`, `HTOT`, `VTOT`, sync positions) and one clock block (`CLKHZ`, `PIXDIV`, `CDIV`,
    `FRAC`, `HST`, `HSP`) to match your core. Then run `sim/run.sh` (add `-DLUT2` for
    `LUT_LAT 2`, `-DPACKED` for `LUT_EXT 0`), and `-DDEFL=4 -DVHEIGHT=6`. They must pass.
+   The first line printed is the half-line count it expects for your frame rate.
 3. **Build** and read the timing report. Negative slack on your new paths (the palette read,
    the module) is a real finding; fix it before hardware.
 4. **Read your diff back** against the upstream core. Check four things:
