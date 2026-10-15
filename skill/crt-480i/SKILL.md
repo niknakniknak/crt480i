@@ -37,7 +37,9 @@ Write these down before editing anything:
 2. H and V totals and the active area, from the counters (the module measures them at run
    time, but you need them to choose parameters and to check the limits in `README.md`).
 3. The frame rate (49 Hz up to 62.86 Hz, or the module never locks; the module picks the
-   line count itself, e.g. 625 at 50 Hz, 571 at 54.8 Hz, 525 at 60 Hz), the frame-period
+   line count itself, e.g. 625 at 50 Hz, 571 at 54.8 Hz, 525 at 60 Hz; a board that runs fewer
+   half-lines above 60 Hz, like Popeye's 513 at 61.4 Hz, needs `HL_MIN` and `VIS_LINES`, see
+   `README.md` Parameters), the frame-period
    stability (must match within 4 clocks frame to frame) and the line rates: the ring needs
    `active lines - output lines x (source line rate / 15.7 kHz) + 3 < RING` (16.5 kHz above
    60 Hz), output lines = the smallest Height offered (active/2 at 1:1, 200 if Height can

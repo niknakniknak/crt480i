@@ -8,9 +8,11 @@
 //   rate     VTOTAL=n, HTOTAL=n (frame rate: VTOTAL=500 is 50 Hz, 456 54.8, 435 57.5, 417 59.95;
 //            HTOTAL=610 VTOTAL=418 62.75) | NOLOCK (that rate is outside the window: must never lock)
 //            | RATECHG (VTOTAL changes to 500, 50 Hz, mid-run: it must unlock and relock at 625)
-//   module   DEFL=0..4, VHEIGHT=0..6, HOFF=n, VOFF=n, LUT2, PACKED (LUT_EXT=0)
+//   module   DEFL=0..4, VHEIGHT=0..6, HOFF=n, VOFF=n, LUT2, PACKED (LUT_EXT=0),
+//            HLMIN=n (HL_MIN, default 525), VISL=n (VIS_LINES, default 240)
 //   events   MIDRESET (source reset mid-line) | VSLOSS (the source VSync stops, then returns) |
-//            MENUCHG (Height and V-Position change mid-run, then change back)
+//            MENUCHG (Height and V-Position change mid-run, then change back) |
+//            LJIT (every other frame, the line before the last active one is 1 clk longer)
 //   output   DUMP="file" (every locked output pixel, for bit-exact comparisons)
 `timescale 1ns/1ps
 `ifndef DEFL
@@ -24,6 +26,12 @@
 `endif
 `ifndef VOFF
 `define VOFF 0
+`endif
+`ifndef HLMIN
+`define HLMIN 525
+`endif
+`ifndef VISL
+`define VISL 240
 `endif
 module tb;
 
@@ -82,10 +90,11 @@ localparam integer HS0 = HACT + 32, VS0 = VACT + 8;
 integer vtot = VTOT;                                // RATECHG changes it
 localparam integer WOUT = HACT > 512 ? 512 : HACT;  // pixels per output line
 // active lines per field, and the first active line (centred, offset, then clamped)
-localparam integer NOUT = `VHEIGHT ? 192 + 8*`VHEIGHT : (VACT/2 > 240 ? 240 : VACT/2);
+localparam integer NOUT0 = `VHEIGHT ? 192 + 8*`VHEIGHT : VACT/2;
+localparam integer NOUT  = NOUT0 > `VISL ? `VISL : NOUT0;
 // Half-lines a frame expected (the rule in the module header, worked here in real numbers): lines a
-// field L = floor(15075 / fps + 11), HL = 2L + 1, at least 525. The extra lines of a slower frame
-// go half above the visible window: it starts (HL - 525) / 4 lines lower.
+// field L = floor(15075 / fps + 11), HL = 2L + 1, at least HL_MIN. The extra lines of a slower frame
+// go half above the visible window: it starts floor((HL - 525) / 4) lines lower (higher below 525).
 integer TFS, HLX, VRAW, VEXP;                                   // source frame (clk), expected
 real    fps_s, lx;
 task expect_rate; begin
@@ -93,8 +102,8 @@ task expect_rate; begin
     fps_s = 1.0 * CLKHZ / TFS;
     lx    = 15075.0 / fps_s + 11.0;
     HLX   = 2 * $rtoi(lx) + 1;
-    if( HLX < 525 ) HLX = 525;
-    VRAW  = 21 + (HLX - 525)/4 + (240 - NOUT)/2 + `VOFF;
+    if( HLX < `HLMIN ) HLX = `HLMIN;
+    VRAW  = 21 + (HLX >= 525 ? (HLX - 525)/4 : -((525 - HLX + 3)/4)) + (`VISL - NOUT)/2 + `VOFF;
     VEXP  = VRAW < 6 ? 6 : VRAW > (HLX-1)/2 - NOUT ? (HLX-1)/2 - NOUT : VRAW;
     $display("source %.3f Hz (%0d clk), 15075/fps+11 = %.3f: %0d half-lines, first active line %0d", fps_s, TFS, lx, HLX, VEXP);
 end endtask
@@ -105,11 +114,19 @@ reg [1:0] cediv = 0;
 reg       ce_pix = 0;
 reg [10:0] h_count = HTOT-1;
 reg  [9:0] v_count = VTOT-1;
+reg [7:0] sframe = 0;                               // source frame number
+reg       jdone = 0;
+`ifdef LJIT
+wire      jstall = sframe[0] && !jdone && v_count == VACT-2 && h_count == HACT && cediv == PIXDIV;
+`else
+wire      jstall = 0;
+`endif
 always @(posedge clk) begin
-    cediv  <= reset || cediv == PIXDIV ? 2'd0 : cediv + 1'd1;
-    ce_pix <= !reset && cediv == PIXDIV;
+    jdone  <= v_count == 0 ? 1'b0 : jdone | jstall;
+    cediv  <= reset || (cediv == PIXDIV && !jstall) ? 2'd0 : jstall ? cediv : cediv + 1'd1;
+    ce_pix <= !reset && !jstall && cediv == PIXDIV;
     if( reset ) begin h_count <= HTOT-1; v_count <= vtot-1; end
-    else if( cediv == PIXDIV ) begin
+    else if( cediv == PIXDIV && !jstall ) begin
         if( h_count == HTOT-1 ) begin h_count <= 0; v_count <= v_count >= vtot-1 ? 10'd0 : v_count + 1'd1; end
         else h_count <= h_count + 1'd1;
     end
@@ -118,7 +135,6 @@ wire hblank = h_count >= HACT, vblank = v_count >= VACT;
 wire hsync  = h_count >= HS0 && h_count < HS0 + 64;
 wire vsync  = v_count >= VS0 && v_count < VS0 + 8 && !vs_kill;
 
-reg [7:0] sframe = 0;                               // source frame number
 reg       vsync_l = 0;
 always @(posedge clk) begin
     vsync_l <= vsync;
@@ -170,7 +186,7 @@ localparam integer LUTE = 1;
 `endif
 
 crt_480i #(.CLK_HZ(CLKHZ), .CLK_DIV(CDIV), .RING(RINGN), .CLK_FRAC(FRAC), .H_START(HST), .HS_PIX(HSP),
-           .PW(24), .LUT_EXT(LUTE), .LUT_LAT(LUTL)) u_dut (
+           .PW(24), .LUT_EXT(LUTE), .LUT_LAT(LUTL), .HL_MIN(`HLMIN), .VIS_LINES(`VISL)) u_dut (
     .clk(clk), .ce_in(ce_pix), .pix_in({r, g, b}), .vs_in(vs), .de_in(de),
     .hoffset(7'(`HOFF)), .voffset(voffset), .deflicker(3'(`DEFL)), .vheight(vheight),
     .lut_addr(lut_addr), .lut_rgb(lut_rgb),

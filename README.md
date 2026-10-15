@@ -54,7 +54,7 @@ damage to your monitor or other equipment.
 
 ```
 rtl/crt_480i.sv      the module: one SystemVerilog file, Quartus 17 friendly
-sim/                 self-checking testbench, run.sh (one run), sweep.sh (62 runs)
+sim/                 self-checking testbench, run.sh (one run), sweep.sh (73 runs)
 examples/            sys.patch (the framework change) and three complete cores
 AGENTS.md            instructions for an AI coding agent doing the port
 skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-skill.sh)
@@ -72,12 +72,15 @@ skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-s
   frame rate, so a fixed 525 would give 14.4 kHz at 54.8 Hz and 13.1 kHz at 50 Hz, which a 15
   kHz CRT cannot hold. The module measures the frame and picks the odd count nearest a line
   rate of 15075 + 11 x frame rate (Hz): 525 at 59.94 Hz, 625 at 50 Hz, 571 at 54.8 Hz, 547 at
-  57.5 Hz, all 15.6-15.8 kHz. Never fewer than 525: from 59.94 Hz up a field keeps 262.5 lines
+  57.5 Hz, all 15.6-15.8 kHz. Never fewer than 525 (`HL_MIN`): from 59.94 Hz up a field keeps 262.5 lines
   and the line rate rises with the frame rate (16.5 kHz at 62.86 Hz). The extra lines of a
   slower frame are split above and below the picture, so it stays centred. The count is
-  held while locked.
+  held while locked. A game whose own board runs fewer half-lines a frame (Popeye: 513 at
+  61.4 Hz, 15.74 kHz) sets `HL_MIN` to that count, with `VIS_LINES` small enough to fit.
 - **Phase-locked.** Each field starts a measured delay after the source VSync: no drift, no
-  dropped or repeated frames. Latency is under one frame.
+  dropped or repeated frames. Latency is under one frame. The delay is measured from the
+  source's last active line and held while locked, so a source whose line period alternates
+  by one clock (Popeye's does) still gives fields of exactly the same length.
 - **Self-measuring.** Frame period, line period, active size and VSync-to-picture time are
   measured, not configured. It locks once 3 frames in a row have matched periods (within
   4 clocks), about 5 frames after the core starts, and only from 49 Hz up to the rate where
@@ -105,7 +108,9 @@ skill/crt-480i/      the same, as an agent skill (built from AGENTS.md by make-s
 | `LUT_EXT` | 1 | 1: colours come from the core via `lut_addr` -> `lut_rgb`; 0: `pix_in` is packed RGB |
 | `LUT_LAT` | 1 | clocks from `lut_addr` to `lut_rgb`, 1 or 2 (`LUT_EXT=1` only). Use 2, and register your palette output, if the palette logic is heavy. |
 | `W_MAX` / `RING` | 512 / 96 | stored width (a power of 2) and number of stored lines. Pixels past `W_MAX` are dropped. |
-| `H_START`, `HS_PIX`, `VIS_FIRST`, `VIS_LINES`, `VS_HL`, `VS_LEN` | | output timing; the defaults are standard 480i |
+| `HL_MIN` | 525 | fewest half-lines a frame (odd). Below 525 only for a game whose board runs fewer (Popeye: 513), and only with a picture of fewer than 240 lines a field: `VIS_FIRST + VIS_LINES` must fit the shorter field. |
+| `VIS_LINES` | 240 | visible lines a field; the picture is centred in them. Lower it with `HL_MIN` (Popeye: 238). |
+| `H_START`, `HS_PIX`, `VIS_FIRST`, `VS_HL`, `VS_LEN` | | output timing; the defaults are standard 480i |
 
 The build stops with a named error (a missing module called, for example,
 `crt_480i_output_pixel_clock_too_fast`) if `CLK_HZ` is missing, `CLK_DIV` is below 3, the
@@ -226,8 +231,8 @@ cd sim
 ./run.sh -DDEFL=4 -DVHEIGHT=6             # Full deflicker, 240 lines per field
 ./run.sh -DCLK64 -DLUT2 -DMIDRESET        # 64 MHz, CLK_DIV 6, 2-clock palette, reset mid-line
 ./run.sh -DVTOTAL=500                     # a 50 Hz source: 625 half-lines, 15.625 kHz
-./sweep.sh                                # the whole matrix, 62 runs, several at a time
-./mutants.sh                              # 13 deliberately broken modules: every one must FAIL
+./sweep.sh                                # the whole matrix, 73 runs, several at a time
+./mutants.sh                              # 17 deliberately broken modules: every one must FAIL
 ```
 
 All defines are listed at the top of `tb_crt_480i.sv`: clocks (including the fractional
